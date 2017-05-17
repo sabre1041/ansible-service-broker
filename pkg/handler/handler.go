@@ -6,12 +6,14 @@ import (
 	"os"
 	"strconv"
 
+	"k8s.io/apimachinery/pkg/api/errors"
+
+	"github.com/coreos/etcd/client"
 	"github.com/fusor/ansible-service-broker/pkg/broker"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	logging "github.com/op/go-logging"
 	"github.com/pborman/uuid"
-	"k8s.io/apimachinery/pkg/api/errors"
 )
 
 // TODO: implement asynchronous operations
@@ -23,9 +25,12 @@ type handler struct {
 	log    *logging.Logger
 }
 
+// GorillaRouteHandler - gorilla route handler
 // making the handler methods more testable by moving the reliance of mux.Vars()
 // outside of the handlers themselves
 type GorillaRouteHandler func(http.ResponseWriter, *http.Request)
+
+// VarHandler - Variable route handler.
 type VarHandler func(http.ResponseWriter, *http.Request, map[string]string)
 
 func createVarHandler(r VarHandler) GorillaRouteHandler {
@@ -34,6 +39,7 @@ func createVarHandler(r VarHandler) GorillaRouteHandler {
 	}
 }
 
+// NewHandler - Create a new handler by attaching the routes and setting logger and broker.
 func NewHandler(b broker.Broker, log *logging.Logger) http.Handler {
 	h := handler{
 		router: *mux.NewRouter(),
@@ -155,11 +161,16 @@ func (h handler) deprovision(w http.ResponseWriter, r *http.Request, params map[
 
 	resp, err := h.broker.Deprovision(instanceUUID)
 
-	if errors.IsNotFound(err) {
-		writeResponse(w, http.StatusGone, broker.DeprovisionResponse{})
-	} else {
-		writeDefaultResponse(w, http.StatusOK, resp, err)
+	if err != nil {
+		h.log.Debug("err for deprovision - %#v", err)
 	}
+	if etcdErr, ok := err.(client.Error); ok {
+		if etcdErr.Code == client.ErrorCodeKeyNotFound {
+			writeResponse(w, http.StatusGone, broker.DeprovisionResponse{})
+			return
+		}
+	}
+	writeDefaultResponse(w, http.StatusOK, resp, err)
 }
 
 func (h handler) bind(w http.ResponseWriter, r *http.Request, params map[string]string) {
