@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/coreos/etcd/client"
+	docker "github.com/fsouza/go-dockerclient"
 	"github.com/fusor/ansible-service-broker/pkg/apb"
 	"github.com/fusor/ansible-service-broker/pkg/dao"
 	logging "github.com/op/go-logging"
@@ -13,11 +15,15 @@ import (
 )
 
 var (
+	// ErrorAlreadyProvisioned - Error for when an service instance has already been provisioned
 	ErrorAlreadyProvisioned = errors.New("already provisioned")
-	ErrorDuplicate          = errors.New("duplicate instance")
-	ErrorNotFound           = errors.New("not found")
+	// ErrorDuplicate - Error for when a duplicate service instance already exists
+	ErrorDuplicate = errors.New("duplicate instance")
+	// ErrorNotFound  - Error for when a service instance is not found. (either etcd or kubernetes)
+	ErrorNotFound = errors.New("not found")
 )
 
+// Broker - A broker is used to to compelete all the tasks that a broker must be able to do.
 type Broker interface {
 	Bootstrap() (*BootstrapResponse, error)
 	Catalog() (*CatalogResponse, error)
@@ -29,6 +35,7 @@ type Broker interface {
 	LastOperation(uuid.UUID, *LastOperationRequest) (*LastOperationResponse, error)
 }
 
+// AnsibleBroker - Broker using ansible and images to interact with oc/kubernetes/etcd
 type AnsibleBroker struct {
 	dao           *dao.Dao
 	log           *logging.Logger
@@ -37,6 +44,7 @@ type AnsibleBroker struct {
 	engine        *WorkEngine
 }
 
+// NewAnsibleBroker - creates a new ansbile broker
 func NewAnsibleBroker(
 	dao *dao.Dao,
 	log *logging.Logger,
@@ -56,7 +64,7 @@ func NewAnsibleBroker(
 	return broker, nil
 }
 
-// Loads all known specs from a registry into local storage for reference
+// Bootstrap - Loads all known specs from a registry into local storage for reference
 // Potentially a large download; on the order of 10s of thousands
 // TODO: Response here? Async?
 // TODO: How do we handle a large amount of data on this side as well? Pagination?
@@ -77,6 +85,7 @@ func (a AnsibleBroker) Bootstrap() (*BootstrapResponse, error) {
 	return &BootstrapResponse{SpecCount: len(specs), ImageCount: imageCount}, nil
 }
 
+// Catalog - returns the catalog of services defined
 func (a AnsibleBroker) Catalog() (*CatalogResponse, error) {
 	a.log.Info("AnsibleBroker::Catalog")
 
@@ -98,6 +107,7 @@ func (a AnsibleBroker) Catalog() (*CatalogResponse, error) {
 	return &CatalogResponse{services}, nil
 }
 
+// Provision  - will provision a service
 func (a AnsibleBroker) Provision(instanceUUID uuid.UUID, req *ProvisionRequest, async bool) (*ProvisionResponse, error) {
 	////////////////////////////////////////////////////////////
 	//type ProvisionRequest struct {
@@ -170,8 +180,8 @@ func (a AnsibleBroker) Provision(instanceUUID uuid.UUID, req *ProvisionRequest, 
 	var err error
 
 	// Retrieve requested spec
-	specId := req.ServiceID.String()
-	if spec, err = a.dao.GetSpec(specId); err != nil {
+	specID := req.ServiceID.String()
+	if spec, err = a.dao.GetSpec(specID); err != nil {
 		// etcd return not found i.e. code 100
 		if strings.HasPrefix(err.Error(), "100") {
 			return nil, ErrorNotFound
@@ -253,6 +263,7 @@ func (a AnsibleBroker) Provision(instanceUUID uuid.UUID, req *ProvisionRequest, 
 	return &ProvisionResponse{Operation: token}, nil
 }
 
+// Deprovision - will deprovision a service.
 func (a AnsibleBroker) Deprovision(instanceUUID uuid.UUID) (*DeprovisionResponse, error) {
 	////////////////////////////////////////////////////////////
 	// Deprovision flow
@@ -265,23 +276,35 @@ func (a AnsibleBroker) Deprovision(instanceUUID uuid.UUID) (*DeprovisionResponse
 	//    decide what's important?
 	//    * if noerror: delete serviceInstance entry with Dao
 	////////////////////////////////////////////////////////////
-	var err error
-	var instance *apb.ServiceInstance
-	instanceId := instanceUUID.String()
+	instanceID := instanceUUID.String()
 
-	if err = a.validateDeprovision(instanceId); err != nil {
+	if err := a.validateDeprovision(instanceID); err != nil {
+		return nil, err
+	}
+	instance, err := a.dao.GetServiceInstance(instanceID)
+	/// Handle case where service is not found in etcd
+	if client.IsKeyNotFound(err) {
+		a.log.Debug("unable to find service instance - %#v", err)
+		return nil, ErrorNotFound
+	}
+	// bubble up  error
+	if err != nil {
+		a.log.Error("unknown etcd error - %#v", err)
+		return nil, err
+	}
+	err = apb.Deprovision(instance, a.log)
+	// TODO: Right now the client we are using does not expose bb
+	if err == docker.ErrNoSuchImage {
+		a.log.Debug("unable to find service instance - %#v", err)
+		return nil, ErrorNotFound
+	}
+	// bubble up error.
+	if err != nil {
+		a.log.Error("unknown etcd error - %#v", err)
 		return nil, err
 	}
 
-	if instance, err = a.dao.GetServiceInstance(instanceId); err != nil {
-		return nil, err
-	}
-
-	if err = apb.Deprovision(instance, a.log); err != nil {
-		return nil, err
-	}
-
-	a.dao.DeleteServiceInstance(instanceId)
+	a.dao.DeleteServiceInstance(instanceID)
 
 	return &DeprovisionResponse{Operation: "successful"}, nil
 }
@@ -293,8 +316,8 @@ func (a AnsibleBroker) validateDeprovision(id string) error {
 	return nil
 }
 
+// Bind - will create a binding between a service.
 func (a AnsibleBroker) Bind(instanceUUID uuid.UUID, bindingUUID uuid.UUID, req *BindRequest) (*BindResponse, error) {
-
 	// binding_id is the id of the binding.
 	// the instanceUUID is the previously provisioned service id.
 	//
@@ -404,14 +427,17 @@ func mergeCredentials(
 	return provExtCreds.Credentials
 }
 
+// Unbind - unbind a services previous binding NOTE: not implemented.
 func (a AnsibleBroker) Unbind(instanceUUID uuid.UUID, bindingUUID uuid.UUID) error {
 	return notImplemented
 }
 
+// Update - update a service NOTE: not implemented
 func (a AnsibleBroker) Update(instanceUUID uuid.UUID, req *UpdateRequest) (*UpdateResponse, error) {
 	return nil, notImplemented
 }
 
+// LastOperation - gets the last operation and status
 func (a AnsibleBroker) LastOperation(instanceUUID uuid.UUID, req *LastOperationRequest) (*LastOperationResponse, error) {
 	/*
 		look up the resource in etcd the operation should match what was returned by provision
